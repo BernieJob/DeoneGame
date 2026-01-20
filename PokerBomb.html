@@ -71,22 +71,25 @@
 
         function App() {
             const [gameMode, setGameMode] = useState(null); 
-            const [p1Hand, setP1Hand] = useState([]); // 我方的牌（對方裝彈在這裡）
-            const [p2Hand, setP2Hand] = useState([]); // 對方的牌（我方裝彈在這裡）
+            const [p1Hand, setP1Hand] = useState([]); 
+            const [p2Hand, setP2Hand] = useState([]); 
             const [phase, setPhase] = useState('MENU'); 
             const [scores, setScores] = useState({ p1: 0, p2: 0 });
             const [gameResult, setGameResult] = useState(null);
             const [hint, setHint] = useState("");
-            const [timer, setTimer] = useState(5);
+            const [timer, setTimer] = useState(10);
 
             const [peerId, setPeerId] = useState("");
             const [targetId, setTargetId] = useState("");
             const [conn, setConn] = useState(null);
             const peerRef = useRef(null);
 
-            // 用於即時檢查狀態的 Ref
+            // 狀態控制 Ref
             const p1HandRef = useRef([]);
             const p2HandRef = useRef([]);
+            const localChoiceDir = useRef(null);
+            const remoteChoiceDir = useRef(null);
+
             useEffect(() => { p1HandRef.current = p1Hand; }, [p1Hand]);
             useEffect(() => { p2HandRef.current = p2Hand; }, [p2Hand]);
 
@@ -102,19 +105,23 @@
                 return () => newPeer.destroy();
             }, []);
 
-            // 5秒計時器邏輯
+            // 10秒計時器邏輯
             useEffect(() => {
                 let interval;
-                if (phase === 'BOMBING_P1') {
-                    setTimer(5);
+                if (phase === 'BOMBING_P1' || phase === 'CHOOSE_DIR') {
+                    setTimer(10);
                     interval = setInterval(() => {
                         setTimer(t => {
                             if (t <= 1) {
                                 clearInterval(interval);
-                                // 時間到，自動裝彈
-                                const alreadySet = p2HandRef.current.some(c => c.isBomb);
-                                if (!alreadySet) {
-                                    handleCardClick('p2', Math.floor(Math.random() * 5));
+                                if (phase === 'BOMBING_P1') {
+                                    if (!p2HandRef.current.some(c => c.isBomb)) {
+                                        handleCardClick('p2', Math.floor(Math.random() * 5));
+                                    }
+                                } else if (phase === 'CHOOSE_DIR') {
+                                    if (!localChoiceDir.current) {
+                                        handleCardClick('p1', Math.random() > 0.5 ? 0 : 4);
+                                    }
                                 }
                                 return 0;
                             }
@@ -155,16 +162,18 @@
                         setP1Hand(prev => {
                             const next = [...prev];
                             next[data.index].isBomb = true;
-                            // 檢查：如果我方也已經裝過彈了，就進入選牌
                             if (p2HandRef.current.some(c => c.isBomb)) {
                                 setPhase('CHOOSE_DIR');
-                                setHint("雙方已裝彈！請選一端開始翻牌");
                             }
                             return next;
                         });
                         break;
-                    case 'START_REVEAL':
-                        executeReveal(data.direction);
+                    case 'SYNC_DIR':
+                        remoteChoiceDir.current = data.direction;
+                        if (localChoiceDir.current) {
+                            // 雙方都選好了，由發起者(Host)決定最終翻牌邏輯或各自執行
+                            executeReveal(localChoiceDir.current);
+                        }
                         break;
                 }
             };
@@ -180,9 +189,13 @@
 
             useEffect(() => {
                 if (phase === 'BOMBING_P1') {
-                    setHint(`請在對面裝彈 (${timer}s)`);
+                    setHint(`安裝炸彈-思考時間 (${timer}s)`);
                 } else if (phase === 'WAITING') {
-                    setHint("等待對方裝設炸彈...");
+                    setHint("等待對方安裝炸彈...");
+                } else if (phase === 'CHOOSE_DIR') {
+                    setHint(`翻牌起始位置-思考時間 (${timer}s)`);
+                } else if (phase === 'WAITING_DIR') {
+                    setHint("等待對方選擇方向...");
                 } else if (gameMode === 'AI' && phase === 'BOMBING_P2') {
                     setHint("AI 正在裝設炸彈...");
                     setTimeout(() => {
@@ -190,7 +203,6 @@
                             const next = [...prev];
                             next[Math.floor(Math.random() * 5)].isBomb = true;
                             setPhase('CHOOSE_DIR');
-                            setHint("點擊最左或最右的牌決定方向");
                             return next;
                         });
                     }, 1200);
@@ -198,16 +210,14 @@
             }, [phase, timer, gameMode]);
 
             const handleCardClick = (owner, index) => {
-                // 裝彈階段：點擊對方的牌
                 if (phase === 'BOMBING_P1' && owner === 'p2') {
                     const next = [...p2Hand];
-                    if (next.some(c => c.isBomb)) return; // 禁止重複裝彈
+                    if (next.some(c => c.isBomb)) return;
                     next[index].isBomb = true;
                     setP2Hand(next);
 
                     if (gameMode === 'ONLINE') {
                         conn.send({ type: 'PLACE_BOMB', index });
-                        // 檢查對方是否已經把彈放好了
                         if (p1HandRef.current.some(c => c.isBomb)) {
                             setPhase('CHOOSE_DIR');
                         } else {
@@ -217,13 +227,20 @@
                         setPhase('BOMBING_P2');
                     }
                 }
-                // 選方向階段：點擊自己的左右邊緣
                 else if (phase === 'CHOOSE_DIR' && owner === 'p1') {
                     const dir = index === 0 ? 'LR' : 'RL';
+                    localChoiceDir.current = dir;
+
                     if (gameMode === 'ONLINE') {
-                        conn.send({ type: 'START_REVEAL', direction: dir });
+                        conn.send({ type: 'SYNC_DIR', direction: dir });
+                        if (remoteChoiceDir.current) {
+                            executeReveal(dir);
+                        } else {
+                            setPhase('WAITING_DIR');
+                        }
+                    } else {
+                        executeReveal(dir);
                     }
-                    executeReveal(dir);
                 }
             };
 
@@ -268,7 +285,7 @@
                     
                     <div className="mb-2 sm:mb-4 text-center z-10">
                         <h1 className="text-3xl sm:text-5xl font-black italic tracking-tighter text-transparent bg-clip-text bg-gradient-to-b from-white to-gray-500 drop-shadow-glow">POKER BOMB <span className="text-red-600">2.5D</span></h1>
-                        {phase !== 'MENU' && <div className={`mt-2 px-4 py-1 sm:px-6 sm:py-2 bg-white/10 backdrop-blur-md rounded-full border border-white/20 text-[10px] sm:text-sm font-mono tracking-widest max-w-[90vw] mx-auto truncate ${timer <= 2 && phase === 'BOMBING_P1' ? 'text-red-500 animate-pulse' : 'text-yellow-400'}`}>{hint}</div>}
+                        {phase !== 'MENU' && <div className={`mt-2 px-4 py-1 sm:px-6 sm:py-2 bg-white/10 backdrop-blur-md rounded-full border border-white/20 text-[10px] sm:text-sm font-mono tracking-widest max-w-[90vw] mx-auto truncate ${timer <= 3 && (phase === 'BOMBING_P1' || phase === 'CHOOSE_DIR') ? 'text-red-500 animate-pulse' : 'text-yellow-400'}`}>{hint}</div>}
                     </div>
 
                     {phase === 'MENU' ? (
