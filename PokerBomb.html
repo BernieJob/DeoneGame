@@ -71,8 +71,8 @@
 
         function App() {
             const [gameMode, setGameMode] = useState(null); 
-            const [p1Hand, setP1Hand] = useState([]);
-            const [p2Hand, setP2Hand] = useState([]);
+            const [p1Hand, setP1Hand] = useState([]); // 我方的牌（對方裝彈在這裡）
+            const [p2Hand, setP2Hand] = useState([]); // 對方的牌（我方裝彈在這裡）
             const [phase, setPhase] = useState('MENU'); 
             const [scores, setScores] = useState({ p1: 0, p2: 0 });
             const [gameResult, setGameResult] = useState(null);
@@ -82,23 +82,19 @@
             const [peerId, setPeerId] = useState("");
             const [targetId, setTargetId] = useState("");
             const [conn, setConn] = useState(null);
-            const [isHost, setIsHost] = useState(false);
             const peerRef = useRef(null);
 
-            // 用於同步狀態的 Ref
+            // 用於即時檢查狀態的 Ref
             const p1HandRef = useRef([]);
             const p2HandRef = useRef([]);
-            const phaseRef = useRef('MENU');
             useEffect(() => { p1HandRef.current = p1Hand; }, [p1Hand]);
             useEffect(() => { p2HandRef.current = p2Hand; }, [p2Hand]);
-            useEffect(() => { phaseRef.current = phase; }, [phase]);
 
             useEffect(() => {
                 const newPeer = new Peer();
                 peerRef.current = newPeer;
                 newPeer.on('open', (id) => setPeerId(id));
                 newPeer.on('connection', (c) => {
-                    setIsHost(true);
                     setConn(c);
                     setGameMode('ONLINE');
                     setupConn(c);
@@ -115,8 +111,9 @@
                         setTimer(t => {
                             if (t <= 1) {
                                 clearInterval(interval);
-                                // 時間到，若還沒裝彈則隨機選一張
-                                if (!p2HandRef.current.some(c => c.isBomb)) {
+                                // 時間到，自動裝彈
+                                const alreadySet = p2HandRef.current.some(c => c.isBomb);
+                                if (!alreadySet) {
                                     handleCardClick('p2', Math.floor(Math.random() * 5));
                                 }
                                 return 0;
@@ -142,7 +139,6 @@
 
             const joinGame = () => {
                 const c = peerRef.current.connect(targetId);
-                setIsHost(false);
                 setConn(c);
                 setGameMode('ONLINE');
                 setupConn(c);
@@ -159,7 +155,7 @@
                         setP1Hand(prev => {
                             const next = [...prev];
                             next[data.index].isBomb = true;
-                            // 檢查自己是否也裝好彈了
+                            // 檢查：如果我方也已經裝過彈了，就進入選牌
                             if (p2HandRef.current.some(c => c.isBomb)) {
                                 setPhase('CHOOSE_DIR');
                                 setHint("雙方已裝彈！請選一端開始翻牌");
@@ -184,40 +180,44 @@
 
             useEffect(() => {
                 if (phase === 'BOMBING_P1') {
-                    setHint(`限時裝彈：${timer}秒 (請點擊對方卡牌)`);
+                    setHint(`請在對面裝彈 (${timer}s)`);
+                } else if (phase === 'WAITING') {
+                    setHint("等待對方裝設炸彈...");
                 } else if (gameMode === 'AI' && phase === 'BOMBING_P2') {
                     setHint("AI 正在裝設炸彈...");
                     setTimeout(() => {
-                        const next = [...p1Hand];
-                        next[Math.floor(Math.random() * 5)].isBomb = true;
-                        setP1Hand(next);
-                        setPhase('CHOOSE_DIR');
-                        setHint("點擊最左或最右的牌決定開牌方向");
-                    }, 1000);
+                        setP1Hand(prev => {
+                            const next = [...prev];
+                            next[Math.floor(Math.random() * 5)].isBomb = true;
+                            setPhase('CHOOSE_DIR');
+                            setHint("點擊最左或最右的牌決定方向");
+                            return next;
+                        });
+                    }, 1200);
                 }
             }, [phase, timer, gameMode]);
 
             const handleCardClick = (owner, index) => {
+                // 裝彈階段：點擊對方的牌
                 if (phase === 'BOMBING_P1' && owner === 'p2') {
                     const next = [...p2Hand];
-                    if (next.some(c => c.isBomb)) return; // 防止重複點擊
+                    if (next.some(c => c.isBomb)) return; // 禁止重複裝彈
                     next[index].isBomb = true;
                     setP2Hand(next);
 
                     if (gameMode === 'ONLINE') {
                         conn.send({ type: 'PLACE_BOMB', index });
-                        // 檢查對方是否已經裝好彈
+                        // 檢查對方是否已經把彈放好了
                         if (p1HandRef.current.some(c => c.isBomb)) {
                             setPhase('CHOOSE_DIR');
-                            setHint("雙方已裝彈！請選一端開始翻牌");
                         } else {
                             setPhase('WAITING');
-                            setHint("已裝彈，等待對方...");
                         }
                     } else {
                         setPhase('BOMBING_P2');
                     }
                 }
+                // 選方向階段：點擊自己的左右邊緣
                 else if (phase === 'CHOOSE_DIR' && owner === 'p1') {
                     const dir = index === 0 ? 'LR' : 'RL';
                     if (gameMode === 'ONLINE') {
@@ -276,7 +276,7 @@
                             <MenuButton onClick={initGameAI} title="VS AI (單人)" sub="挑戰電腦隨機策略" color="bg-blue-600" />
                             <div className="h-[1px] bg-white/10 my-1"></div>
                             <div className="text-center">
-                                <p className="text-[10px] text-gray-400 mb-1">你的連線 ID (傳給朋友):</p>
+                                <p className="text-[10px] text-gray-400 mb-1">你的連線 ID:</p>
                                 <p className="font-mono text-lg sm:text-xl text-yellow-500 font-bold select-all break-all">{peerId || "正在獲取 ID..."}</p>
                             </div>
                             <div className="flex flex-col gap-2">
