@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>2.5D 撲克炸彈：遠端對決版</title>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/framer-motion@10.16.4/dist/framer-motion.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.6.0/dist/confetti.browser.min.js"></script>
+    <!-- 引入 PeerJS 用於 P2P 連線 -->
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <style>
+        body { background-color: #050505; margin: 0; overflow: hidden; font-family: sans-serif; }
+        .perspective-table { perspective: 1200px; }
+        .table-surface { 
+            transform: rotateX(30deg); 
+            transform-style: preserve-3d;
+            background: radial-gradient(circle, #1e3a8a 0%, #0f172a 100%);
+            box-shadow: 0 50px 100px rgba(0,0,0,0.8);
+        }
+        .preserve-3d { transform-style: preserve-3d; }
+        .backface-hidden { backface-visibility: hidden; }
+        .card-glow { box-shadow: 0 0 20px rgba(255, 215, 0, 0.6); }
+        .drop-shadow-glow { filter: drop-shadow(0 0 10px rgba(255,255,255,0.5)); }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+        const { motion, AnimatePresence } = window.Motion;
+
+        const SUITS = ['♠', '♥', '♦', '♣'];
+        const VALUES = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
+        const VALUE_MAP = { 11: 'J', 12: 'Q', 13: 'K', 14: 'A' };
+
+        const createCard = (id) => {
+            const val = VALUES[Math.floor(Math.random() * VALUES.length)];
+            return {
+                id,
+                suit: SUITS[Math.floor(Math.random() * SUITS.length)],
+                value: val,
+                label: VALUE_MAP[val] || val.toString(),
+                isBomb: false,
+                isRevealed: false
+            };
+        };
+
+        function App() {
+            // --- 遊戲狀態 ---
+            const [gameMode, setGameMode] = useState(null); 
+            const [p1Hand, setP1Hand] = useState([]); // 我方
+            const [p2Hand, setP2Hand] = useState([]); // 對方
+            const [phase, setPhase] = useState('MENU'); 
+            const [scores, setScores] = useState({ p1: 0, p2: 0 });
+            const [gameResult, setGameResult] = useState(null);
+            const [hint, setHint] = useState("");
+
+            // --- 連線相關狀態 ---
+            const [peerId, setPeerId] = useState("");
+            const [targetId, setTargetId] = useState("");
+            const [conn, setConn] = useState(null);
+            const [isHost, setIsHost] = useState(false);
+            const peerRef = useRef(null);
+
+            const p1HandRef = useRef([]);
+            const p2HandRef = useRef([]);
+            useEffect(() => { p1HandRef.current = p1Hand; }, [p1Hand]);
+            useEffect(() => { p2HandRef.current = p2Hand; }, [p2Hand]);
+
+            // --- 連線邏輯 ---
+            useEffect(() => {
+                // 初始化 Peer
+                const newPeer = new Peer();
+                peerRef.current = newPeer;
+
+                newPeer.on('open', (id) => setPeerId(id));
+
+                newPeer.on('connection', (c) => {
+                    setIsHost(true);
+                    setConn(c);
+                    setGameMode('ONLINE');
+                    setupConn(c);
+                });
+
+                return () => newPeer.destroy();
+            }, []);
+
+            const setupConn = (c) => {
+                c.on('open', () => {
+                    setPhase('BOMBING_P1');
+                    setHint("已連線！遊戲開始，請在對面牌陣裝設炸彈");
+                    // 房主生成初始手牌並同步給對方
+                    const h1 = Array.from({ length: 5 }, (_, i) => createCard(`p1-${i}`));
+                    const h2 = Array.from({ length: 5 }, (_, i) => createCard(`p2-${i}`));
+                    setP1Hand(h1);
+                    setP2Hand(h2);
+                    c.send({ type: 'INIT_GAME', h1: h2, h2: h1 }); // 對方視角 p1/p2 會相反
+                });
+
+                c.on('data', (data) => {
+                    handleRemoteData(data);
+                });
+            };
+
+            const joinGame = () => {
+                const c = peerRef.current.connect(targetId);
+                setIsHost(false);
+                setConn(c);
+                setGameMode('ONLINE');
+                setupConn(c);
+            };
+
+            const handleRemoteData = (data) => {
+                switch(data.type) {
+                    case 'INIT_GAME':
+                        setP1Hand(data.h1);
+                        setP2Hand(data.h2);
+                        setPhase('BOMBING_P1');
+                        setHint("已連線！請在對面牌陣裝設炸彈");
+                        break;
+                    case 'PLACE_BOMB':
+                        setP1Hand(prev => {
+                            const next = [...prev];
+                            next[data.index].isBomb = true;
+                            return next;
+                        });
+                        setPhase('CHOOSE_DIR');
+                        setHint("對方已裝設炸彈！請點擊你的最左或最右牌決定開牌方向");
+                        break;
+                    case 'START_REVEAL':
+                        executeReveal(data.direction);
+                        break;
+                }
+            };
+
+            // --- 遊戲邏輯 ---
+            const initGameAI = () => {
+                setGameMode('AI');
+                setP1Hand(Array.from({ length: 5 }, (_, i) => createCard(`p1-${i}`)));
+                setP2Hand(Array.from({ length: 5 }, (_, i) => createCard(`p2-${i}`)));
+                setScores({ p1: 0, p2: 0 });
+                setGameResult(null);
+                setPhase('BOMBING_P1');
+                setHint("請點擊 AI 的一張牌裝設炸彈");
+            };
+
+            useEffect(() => {
+                if (gameMode === 'AI' && phase === 'BOMBING_P2') {
+                    setHint("AI 正在裝設炸彈...");
+                    setTimeout(() => {
+                        const next = [...p1Hand];
+                        next[Math.floor(Math.random() * 5)].isBomb = true;
+                        setP1Hand(next);
+                        setPhase('CHOOSE_DIR');
+                        setHint("決定開牌順序：點擊你自己最左或最右的牌");
+                    }, 1500);
+                }
+            }, [phase, gameMode]);
+
+            const handleCardClick = (owner, index) => {
+                if (phase === 'BOMBING_P1' && owner === 'p2') {
+                    const next = [...p2Hand];
+                    next[index].isBomb = true;
+                    setP2Hand(next);
+                    
+                    if (gameMode === 'ONLINE') {
+                        conn.send({ type: 'PLACE_BOMB', index });
+                        setPhase('WAITING');
+                        setHint("等待對方裝設炸彈...");
+                    } else {
+                        setPhase('BOMBING_P2');
+                    }
+                }
+                else if (phase === 'CHOOSE_DIR' && owner === 'p1') {
+                    const dir = index === 0 ? 'LR' : 'RL';
+                    if (gameMode === 'ONLINE') {
+                        conn.send({ type: 'START_REVEAL', direction: dir });
+                    }
+                    executeReveal(dir);
+                }
+            };
+
+            const executeReveal = async (direction) => {
+                setPhase('REVEALING');
+                setHint("雙方開牌中...");
+                const order = direction === 'LR' ? [0, 1, 2, 3, 4] : [4, 3, 2, 1, 0];
+                let s1 = 0; let s2 = 0;
+                let p1Active = true; let p2Active = true;
+
+                for (let i of order) {
+                    await new Promise(r => setTimeout(r, 900));
+                    if (p1Active) {
+                        setP1Hand(prev => {
+                            const next = [...prev]; next[i].isRevealed = true; return next;
+                        });
+                        if (p1HandRef.current[i].isBomb) p1Active = false;
+                        else s1 += p1HandRef.current[i].value;
+                    }
+                    if (p2Active) {
+                        setP2Hand(prev => {
+                            const next = [...prev]; next[i].isRevealed = true; return next;
+                        });
+                        if (p2HandRef.current[i].isBomb) p2Active = false;
+                        else s2 += p2HandRef.current[i].value;
+                    }
+                    setScores({ p1: s1, p2: s2 });
+                    if (!p1Active && !p2Active) break;
+                }
+
+                setTimeout(() => {
+                    if (s1 > s2) { setGameResult('WIN'); confetti({ particleCount: 150 }); }
+                    else if (s1 < s2) setGameResult('LOSE');
+                    else setGameResult('DRAW');
+                    setPhase('RESULT');
+                }, 1000);
+            };
+
+            return (
+                <div className="flex flex-col items-center justify-center min-h-screen text-white overflow-hidden p-4">
+                    <div className="fixed inset-0 bg-[url('https://www.transparenttextures.com/patterns/carbon-fibre.png')] opacity-20 pointer-events-none"></div>
+                    
+                    <div className="mb-4 text-center z-10">
+                        <h1 className="text-5xl font-black italic tracking-tighter text-transparent bg-clip-text bg-gradient-to-b from-white to-gray-500 drop-shadow-glow">POKER BOMB <span className="text-red-600">2.5D</span></h1>
+                        {phase !== 'MENU' && <div className="mt-4 px-6 py-2 bg-white/10 backdrop-blur-md rounded-full border border-white/20 text-sm font-mono tracking-widest text-yellow-400">{hint}</div>}
+                    </div>
+
+                    {phase === 'MENU' ? (
+                        <div className="z-20 flex flex-col gap-4 w-96 bg-white/5 p-8 rounded-3xl backdrop-blur-xl border border-white/10">
+                            <MenuButton onClick={initGameAI} title="VS AI (單人)" sub="挑戰電腦隨機策略" color="bg-blue-600" />
+                            
+                            <div className="h-[1px] bg-white/10 my-2"></div>
+                            
+                            <div className="text-center">
+                                <p className="text-xs text-gray-400 mb-2">你的連線 ID (傳給朋友):</p>
+                                <p className="font-mono text-xl text-yellow-500 font-bold select-all">{peerId || "正在獲取 ID..."}</p>
+                            </div>
+
+                            <div className="flex flex-col gap-2">
+                                <input 
+                                    type="text" 
+                                    placeholder="輸入對方的 ID" 
+                                    className="bg-black/50 border border-white/20 rounded-xl px-4 py-3 text-center font-mono focus:border-purple-500 outline-none"
+                                    value={targetId}
+                                    onChange={(e) => setTargetId(e.target.value)}
+                                />
+                                <MenuButton onClick={joinGame} title="加入遠端連線" sub="輸入朋友 ID 進行對決" color="bg-purple-600" />
+                            </div>
+                        </div>
+                    ) : (
+                        <div className="perspective-table relative w-full max-w-5xl h-[600px] flex items-center justify-center">
+                            <div className="table-surface absolute inset-0 rounded-[100px] border-[12px] border-slate-800 p-16 flex flex-col justify-between items-center shadow-[0_0_100px_rgba(0,0,0,1)]">
+                                <div className="flex gap-4 transform translate-z-10">
+                                    {p2Hand.map((c, i) => (
+                                        <Card key={c.id} card={c} showBombHint={true} canClick={phase === 'BOMBING_P1'} onClick={() => handleCardClick('p2', i)} />
+                                    ))}
+                                </div>
+                                <div className="flex gap-12 bg-black/80 backdrop-blur-xl px-12 py-6 rounded-3xl border-2 border-white/10 shadow-2xl -rotate-x-10 scale-110">
+                                    <ScoreDisplay label="YOUR SCORE" score={scores.p1} color="text-blue-400" />
+                                    <div className="w-[1px] bg-white/20"></div>
+                                    <ScoreDisplay label="OPPONENT SCORE" score={scores.p2} color="text-red-400" />
+                                </div>
+                                <div className="flex gap-4 transform translate-z-10">
+                                    {p1Hand.map((c, i) => {
+                                        const isEdge = (i === 0 || i === 4) && phase === 'CHOOSE_DIR';
+                                        return (
+                                            <Card key={c.id} card={c} showBombHint={false} isEdge={isEdge} canClick={isEdge} onClick={() => handleCardClick('p1', i)} />
+                                        );
+                                    })}
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    <AnimatePresence>
+                        {gameResult && (
+                            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className={`fixed inset-0 z-[100] flex flex-col items-center justify-center backdrop-blur-sm ${gameResult === 'LOSE' ? 'bg-gray-900/90 grayscale' : 'bg-black/80'}`}>
+                                <motion.div initial={{ y: 50, scale: 0.9 }} animate={{ y: 0, scale: 1 }} className="text-center">
+                                    <div className={`text-9xl font-black mb-12 drop-shadow-2xl ${gameResult === 'WIN' ? 'text-white' : 'text-gray-400'}`}>
+                                        {gameResult === 'WIN' ? "你贏了" : gameResult === 'LOSE' ? "你輸了" : "平手"}
+                                    </div>
+                                    <button onClick={() => location.reload()} className="bg-white text-black px-20 py-5 rounded-full text-2xl font-black hover:bg-yellow-400 transition-all active:scale-95 shadow-[0_10px_0_rgb(200,200,200)]">返回</button>
+                                </motion.div>
+                            </motion.div>
+                        )}
+                    </AnimatePresence>
+                </div>
+            );
+        }
+
+        function MenuButton({ onClick, title, sub, color }) {
+            return (
+                <button onClick={onClick} className={`${color} p-4 rounded-xl text-left transition-all hover:scale-[1.02] hover:brightness-110 active:scale-95 shadow-lg`}>
+                    <div className="text-lg font-bold">{title}</div>
+                    <div className="text-[10px] opacity-70 uppercase tracking-tighter">{sub}</div>
+                </button>
+            );
+        }
+
+        function ScoreDisplay({ label, score, color }) {
+            return (
+                <div className="text-center min-w-[100px]">
+                    <div className={`text-[10px] font-bold uppercase tracking-widest opacity-60 mb-1 ${color}`}>{label}</div>
+                    <div className="text-6xl font-black tabular-nums">{score}</div>
+                </div>
+            );
+        }
+
+        function Card({ card, onClick, canClick, showBombHint, isEdge }) {
+            const isRed = card.suit === '♥' || card.suit === '♦';
+            return (
+                <div className="relative group">
+                    {isEdge && (
+                        <motion.div animate={{ y: [0, -10, 0] }} transition={{ repeat: Infinity }} className="absolute -top-14 left-0 right-0 text-center text-yellow-400 font-black text-sm">
+                            {card.id.endsWith('0') ? '◀ START' : 'START ▶'}
+                        </motion.div>
+                    )}
+                    <motion.div 
+                        whileHover={canClick ? { y: -15, scale: 1.05 } : {}}
+                        animate={{ rotateY: card.isRevealed ? 180 : 0 }}
+                        transition={{ duration: 0.7, type: 'spring', stiffness: 80 }}
+                        onClick={canClick ? onClick : undefined}
+                        className={`relative w-24 h-36 preserve-3d cursor-pointer ${isEdge ? 'card-glow ring-4 ring-yellow-400 rounded-xl' : ''}`}
+                    >
+                        <div className="absolute inset-0 bg-gradient-to-br from-gray-800 to-gray-950 border-2 border-white/20 rounded-xl backface-hidden flex items-center justify-center shadow-2xl">
+                            {showBombHint && card.isBomb && !card.isRevealed && (
+                                <div className="absolute inset-0 flex items-center justify-center bg-red-500/10"><span className="text-4xl opacity-30">💣</span></div>
+                            )}
+                            <div className="w-16 h-24 border border-white/10 rounded-lg flex flex-col items-center justify-center gap-1">
+                                <div className="text-[10px] text-white/20 font-bold">PB 2.5D</div>
+                                <div className="w-8 h-1 bg-white/10 rounded-full"></div>
+                            </div>
+                        </div>
+                        <div className="absolute inset-0 bg-white border-2 border-gray-300 rounded-xl backface-hidden flex flex-col items-center justify-center shadow-2xl" style={{ transform: 'rotateY(180deg)' }}>
+                            {card.isBomb ? (
+                                <span className="text-6xl">💣</span>
+                            ) : (
+                                <div className={`text-center ${isRed ? 'text-red-600' : 'text-slate-900'}`}>
+                                    <div className="text-3xl font-black leading-none">{card.label}</div>
+                                    <div className="text-5xl mt-1">{card.suit}</div>
+                                </div>
+                            )}
+                        </div>
+                    </motion.div>
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
